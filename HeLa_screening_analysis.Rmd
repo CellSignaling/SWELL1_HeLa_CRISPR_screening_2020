@@ -1,0 +1,523 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# CRISPR-Cas9 screening analysis
+
+Analysis of the genome-wide CRISPR-Cas9 screening in HeLa cells after NaCl treatment.
+
+## Loading required libraries
+
+```{r, eval=TRUE}
+library(dplyr)
+library(xlsx)
+library(biomaRt)
+library(ggplot2)
+library(ggrepel)
+```
+
+
+## Build index from TKOv1 sgRNA library
+
+### Obtaining libary in FASTA format
+
+First, we need to preprocess the file downloaded from TKO webpage (http://tko.ccbr.utoronto.ca/) that contains information about the library to generate a FASTA file with all the sequences from the library (>geneId_sgRNAsequence).
+
+```{r, eval=TRUE}
+# Creating derived data directory that will be used for the first time in this chunk
+dir.create("data/derived_data", showWarnings = F)
+# Execute Python script to process TKOv1 library base and supp 
+system2(command = "python", 
+        args = "scripts/TKOv1_base_library_preprocess.py",
+        stdout = F)
+
+system2(command = "python", 
+        args = "scripts/TKOv1_supp_library_preprocess.py",
+        stdout = F)
+```
+
+### Build bowtie index
+
+Now, we create the index for Bowtie from the generated FASTA files.
+```{r, eval=TRUE}
+# Create a folder for log files
+dir.create("log_files", showWarnings = F)
+# Create a folder for Bowtie index files
+dir.create("data/derived_data/index", showWarnings = F)
+# Execute command
+system2(command = "bowtie-build", 
+        args = "data/derived_data/TKOv1_base.fa data/derived_data/index/TKOv1_base_index > log_files/bowtie_build_base_index.log")
+
+system2(command = "bowtie-build", 
+        args = "data/derived_data/TKOv1_supp.fa data/derived_data/index/TKOv1_supp_index > log_files/bowtie_build_supp_index.log")
+```
+
+
+## Map reads with Bowtie and count.
+
+Align with Bowtie, -m1 -v2, against TKO library and count number of ocurrences of reads mapping uniquely to a specific sgRNA. 
+
+### Filtering library information
+
+```{r, eval=TRUE}
+# Filter library information to include:
+## Used FASTQs
+## Splitted information
+
+# Read data
+sampleInfo <- read.delim("data/original_data/sampleInfo.txt", stringsAsFactors = F)
+
+# Extract pattern FASTQ: Number of sample_Idx1-Idx2
+FASTQsLib1 <- grep("Moffat", dir("data/original_data/FASTQ/lib1/"), value = T)
+FASTQsPatternLib1 <- unlist(lapply(strsplit(FASTQsLib1, "_"), function(x) return(paste0(x[c(2,3)], collapse = "_"))))
+FASTQsLib2 <- grep("Moffat", dir("data/original_data/FASTQ/lib2/"), value = T)
+FASTQsPatternLib2 <- unlist(lapply(strsplit(FASTQsLib2, "_"), function(x) return(paste0(x[c(2,3)], collapse = "_"))))
+
+FASTQsPattern <- c(FASTQsPatternLib1, FASTQsPatternLib2)
+
+# Generate pattern in sample info
+sampleInfo$pattern <- paste0(sampleInfo$SampleNum, "_", sampleInfo$Idx_1, "-", sampleInfo$Idx_2)
+
+# Sanity check: Filter samples in the table that are not in the files
+sampleInfoF <- subset(sampleInfo, pattern %in% FASTQsPattern)
+
+# Obtain further information
+sampleInfoF$cellLine <- unlist(lapply(with(sampleInfoF, strsplit(Sample, " ")), function(x) return(x[1])))
+sampleInfoF$library <- unlist(lapply(with(sampleInfoF, strsplit(Sample, " ")), function(x) return(x[2])))
+sampleInfoF$condition <- unlist(lapply(with(sampleInfoF, strsplit(Sample, " ")), function(x) return(paste0(x[3:length(x)], collapse = "_"))))
+
+# Save filtered information
+write.table(sampleInfoF, 
+            file = "data/derived_data/sampleInfoFiltered.txt", 
+            quote = F, 
+            row.names = F, 
+            sep = "\t")
+```
+
+### Mapping with Bowtie
+
+```{r, eval=TRUE}
+dir.create("data/derived_data/BAM")
+dir.create("data/derived_data/counts")
+
+#FASTQ pattern
+fastqPattern = "R1_001.fastq.gz"
+
+# Bowtie arguments info
+mismatches = "2"
+multimapping = "1"
+# Location of the indexes
+baseIndex = "data/derived_data/index/TKOv1_base_index"
+suppIndex = "data/derived_data/index/TKOv1_supp_index"
+
+# Making the script executable
+system2("chmod", "a+x scripts/bowtie_count.sh")
+system2("./scripts/bowtie_count.sh", args = paste(fastqPattern,mismatches, multimapping, baseIndex, "lib1"))
+system2("./scripts/bowtie_count.sh", args = paste(fastqPattern,mismatches, multimapping, suppIndex, "lib2"))
+```
+
+## Join counts data frame
+
+Join the counts to generate the raw counts data frame that will serve as input for MAGeCK.
+
+```{r, eval=TRUE}
+# Read sample info to select counts files by library
+sampleInfoF <- read.delim("data/derived_data/sampleInfoFiltered.txt",
+                          sep = "\t",
+                          stringsAsFactors = F)
+
+# Using sgRNAs id to ensure that we 
+# have considered all the sgRNAs even if one of them is not mapped
+sgRnasLib1 <- read.delim("data/derived_data/sgRNA_identifiers_base.txt", 
+                     stringsAsFactors = F, 
+                     header = F)
+sgRnasLib1 <- as.data.frame(sgRnasLib1[order(sgRnasLib1),])
+
+sgRnasLib2 <- read.delim("data/derived_data/sgRNA_identifiers_supp.txt", 
+                     stringsAsFactors = F, 
+                     header = F)
+sgRnasLib2 <- as.data.frame(sgRnasLib2[order(sgRnasLib2),])
+
+# Directory with count files
+countsDir <- "data/derived_data/counts/"
+countsFiles <- paste0(countsDir, dir(countsDir, pattern = ".counts"))
+
+# Create a data frame to put all the counts that has sgRNAs id
+joinedCountsLib1 <- data.frame(GENE_CLONE = sgRnasLib1[,1])
+joinedCountsLib2 <- data.frame(GENE_CLONE = sgRnasLib2[,1])
+
+# Create directory for the file with joined counts
+dir.create("data/derived_data/joined_counts",showWarnings = F)
+
+for (i in 1:length(countsFiles)){
+  # Read counts file
+  counts <- read.delim(countsFiles[i], 
+             stringsAsFactors = F, 
+             check.names = F)
+  
+  countPattern <- paste0(unlist(strsplit(basename(countsFiles[i]), "_"))[c(2,3)],collapse = "_")
+  library <- sampleInfoF[sampleInfoF$pattern == countPattern, "library"]
+  # Add counts to one or another data frame depending on the library
+  if(library == "lib1"){
+     # Join, and where the row doesn't merge put NA
+     joinedCountsLib1 <- merge(joinedCountsLib1, 
+                    counts, 
+                    all = T)
+    
+  } else if (library == "lib2"){
+    joinedCountsLib2 <- merge(joinedCountsLib2, 
+                    counts, 
+                    all = T)
+  }
+  }
+
+## Default approach
+# Change NA to 0
+joinedCountsLib1[is.na(joinedCountsLib1)] <- 0
+countsOutputLib1 <- "data/derived_data/joined_counts/HeLa_TKOv1_lib1_raw_readcounts.counts"
+
+# Write output to a file
+write.table(joinedCountsLib1, 
+              countsOutputLib1, 
+              sep = "\t", 
+              quote = F, 
+              row.names = F)
+
+joinedCountsLib2[is.na(joinedCountsLib2)] <- 0
+countsOutputLib2 <- "data/derived_data/joined_counts/HeLa_TKOv1_lib2_raw_readcounts.counts"
+
+# Write output to a file
+write.table(joinedCountsLib2, 
+              countsOutputLib2, 
+              sep = "\t", 
+              quote = F, 
+              row.names = F)
+```
+
+## Analysis with MAGeCK (QC and results)
+### Prepare data for MAGeCK
+
+```{r, eval=TRUE}
+# Create directories
+dir.create("data/derived_data/MAGeCK_counts", showWarnings = F)
+
+# Sanity check: Counts file (grep the ones that have .counts as extension)
+originalCountFiles <- grep(".counts$", dir("data/derived_data/joined_counts/", full.names = T), value = T)
+# Sample info 
+sampleInfoF <- read.delim("data/derived_data/sampleInfoFiltered.txt", 
+                         stringsAsFactors = F)
+
+for (i in 1:length(originalCountFiles)){
+  
+    originalCountFile <- originalCountFiles[i]
+    
+    library <- unlist(strsplit(basename(originalCountFile), "_"))[3]
+    
+    # Read it
+    stressCounts <- read.delim(originalCountFile, 
+             stringsAsFactors = F, 
+             check.names = F)
+    
+    # Changing colnames
+    compatibleColnames <- unlist(lapply(strsplit(colnames(stressCounts)[2:8], "_"), function(x) return(paste0(x[c(2,3)], collapse = "_"))))
+    colnames(stressCounts) <- c("GENE_CLONE",sampleInfoF[match(compatibleColnames, sampleInfoF$pattern), "condition"])
+    # Order
+    stressCounts <- stressCounts %>%
+      dplyr::select("GENE_CLONE", "T0", "T8A", "T8B", "T8C", everything())
+
+    # Adding gene column for MAGeCK
+    stressCounts$Gene <- unlist(lapply(strsplit(stressCounts$GENE_CLONE, "_"), function(x) return(x[1])))
+    
+    # Reordering 
+    stressCountsMageck <- data.frame(sgRNA = stressCounts$GENE_CLONE, 
+                                     Gene = stressCounts$Gene, 
+                                     stressCounts[, 2:8], 
+                                     stringsAsFactors = FALSE)
+    
+    if(library == "lib1"){
+      # Eliminating chr10 random and promiscuos guides from the analysis
+      stressCountsMageck <- stressCountsMageck[!stressCountsMageck$Gene == "chr10Rand", ]
+      stressCountsMageck <- stressCountsMageck[!stressCountsMageck$Gene == "chr10Promiscuous", ]
+    }
+      # Writting to a file
+      outputMAGeCK <- paste0("data/derived_data/MAGeCK_counts/HeLa_TKOv1_", library, "_raw_readcounts_MAGeCK.txt")
+      write.table(stressCountsMageck, 
+                outputMAGeCK, 
+                quote = F, 
+                row.names = F, 
+                sep = "\t")
+    
+}
+```
+
+### Execute MAGeCK
+Quality control T8 vs T0 comparison and NaCl vs T0. First we need to execute MAGeCK T8/NaCl vs T0 comparison for each library, merge and execute the analysis without normalization.
+
+```{r, eval=TRUE}
+dir.create("results/HeLa_test/QC", recursive = T, showWarnings = F)
+
+# Samples in control and treatment
+controlSamples <- "T8A,T8B,T8C"
+treatmentSamples <- "T8_150mM_NaCl_A,T8_150mM_NaCl_B,T8_150mM_NaCl_C"
+comparisons <- list(T8 = controlSamples, NaCl = treatmentSamples) 
+
+lapply(names(comparisons), function(comp){
+  print(comp)
+  # Execute MAGeCK
+  system2("mageck", args = c("test",
+                             "-k",
+                             "data/derived_data/MAGeCK_counts/HeLa_TKOv1_lib1_raw_readcounts_MAGeCK.txt", 
+                             "--normcounts-to-file",
+                             "-t", 
+                             comparisons[[comp]],
+                             "-c",
+                             "T0",
+                             "-n",
+                             paste0("results/HeLa_test/QC/Hela_Lib1_QC_MAGeCK_", comp)))
+  
+  system2("mageck", args = c("test",
+                             "-k", 
+                             "data/derived_data/MAGeCK_counts/HeLa_TKOv1_lib2_raw_readcounts_MAGeCK.txt", 
+                             "--normcounts-to-file",
+                             "-t", 
+                             comparisons[[comp]],
+                             "-c",
+                             "T0",
+                             "-n",
+                             paste0("results/HeLa_test/QC/Hela_Lib2_QC_MAGeCK_", comp)))
+  
+  # Read Lib 1
+  qcLib1 <- read.delim(paste0("results/HeLa_test/QC/Hela_Lib1_QC_MAGeCK_", comp,".normalized.txt"), 
+                         stringsAsFactors = F)
+  
+  
+  # Read Lib 2
+  qcLib2 <- read.delim(paste0("results/HeLa_test/QC/Hela_Lib2_QC_MAGeCK_", comp,".normalized.txt"), 
+                         stringsAsFactors = F)
+  
+  # Merging lib1 and lib2 
+  qcHela <- rbind(qcLib1, qcLib2)
+  
+  # Ordering by gene
+  qcHela <- qcHela[order(qcHela$Gene), ]
+  
+  # Writting it into a file
+  write.table(qcHela, 
+              file = paste0("results/HeLa_test/QC/hela_Lib1_Lib2_Norm_Reads_MAGeCK_QC_", comp,".txt"), 
+              quote = F, 
+              row.names = F, 
+              sep = "\t")
+  
+  system2("mageck", args = c("test", 
+                             "-k", 
+                             paste0("results/HeLa_test/QC/hela_Lib1_Lib2_Norm_Reads_MAGeCK_QC_", comp,".txt"), 
+                             "--normcounts-to-file",
+                             "--norm-method none",
+                             "--gene-lfc-method mean",
+                             "-t", 
+                             comparisons[[comp]],
+                             "-c",
+                             "T0",
+                             "-n",
+                             paste0("results/HeLa_test/QC/Hela_Lib1_Lib2_MAGeCK_QC_", comp)))
+  
+  # Enrichment
+  system2("mageck", args = c("pathway",
+                             "--gene-ranking", paste0("results/HeLa_test/QC/Hela_Lib1_Lib2_MAGeCK_QC_", comp,".gene_summary.txt"), 
+                             "--gmt-file",
+                             "data/original_data/c2.cp.kegg.v6.0.symbols.gmt",
+                             "--single-ranking", 
+                             "-n", 
+                             paste0("results/HeLa_test/QC/HeLa_Lib1_Lib2_MAGeCK_QC_", comp)))
+  
+})
+# Write output to an excel file with two sheets ("Control", "NaCl")
+qc <- read.delim("results/HeLa_test/QC/HeLa_Lib1_Lib2_MAGeCK_QC_T8.pathway_summary.txt", stringsAsFactors = F)
+qcNaCl <- read.delim("results/HeLa_test/QC/HeLa_Lib1_Lib2_MAGeCK_QC_NaCl.pathway_summary.txt", stringsAsFactors = F)
+
+
+write.xlsx2(file = "results/HeLa_test/QC/Supplementary_Table_GSEA_output.xlsx", 
+            x = qc[,1:8], 
+            sheetName = "Control", 
+            row.names = F)
+
+write.xlsx2(file = "results/HeLa_test/QC/Supplementary_Table_GSEA_output.xlsx", 
+            x = qcNaCl[,1:8], 
+            sheetName = "NaCl", 
+            append = T, 
+            row.names = F)
+```
+
+NaCl vs T8 comparison.
+Normalize using median normalization for each library. Then, merge and do the analysis without further normalization. 
+
+```{r, eval=TRUE}
+dir.create("results/HeLa_test/MAN")
+
+# Run MAGeCK for library 1
+system2("mageck", args = c("test",
+                           "-k",
+                           "data/derived_data/MAGeCK_counts/HeLa_TKOv1_lib1_raw_readcounts_MAGeCK.txt", 
+                           "--normcounts-to-file",
+                           "-t", 
+                           comparisons$NaCl,
+                           "-c",
+                           comparisons$T8,
+                           "-n",
+                           "results/HeLa_test/MAN/Hela_Lib1_NACL_MAGeCK"))
+
+# Run MAGeCK for library 2
+system2("mageck", args = c("test",
+                           "-k",
+                           "data/derived_data/MAGeCK_counts/HeLa_TKOv1_lib2_raw_readcounts_MAGeCK.txt", 
+                           "--normcounts-to-file",
+                           "-t", 
+                           comparisons$NaCl,
+                           "-c",
+                           comparisons$T8,
+                           "-n",
+                           "results/HeLa_test/MAN/Hela_Lib2_NACL_MAGeCK"))
+
+
+# Read Lib 1
+helaLib1 <- read.delim("results/HeLa_test/MAN/Hela_Lib1_NACL_MAGeCK.normalized.txt", 
+                       stringsAsFactors = F)
+
+
+# Read Lib 2
+helaLib2 <- read.delim("results/HeLa_test/MAN/Hela_Lib2_NACL_MAGeCK.normalized.txt", 
+                       stringsAsFactors = F)
+
+# Merging lib1 and lib2 
+hela <- rbind(helaLib1, helaLib2)
+
+# Ordering by gene
+hela <- hela[order(hela$Gene), ]
+
+# Writting it into a file
+write.table(hela, 
+            file = "data/derived_data/MAGeCK_counts/hela_Lib1_Lib2_Norm_Reads_MAGeCK.txt", 
+            quote = F, 
+            row.names = F, 
+            sep = "\t")
+
+
+system2("mageck", args = c("test", 
+                           "-k",
+                           "data/derived_data/MAGeCK_counts/hela_Lib1_Lib2_Norm_Reads_MAGeCK.txt", 
+                           "--normcounts-to-file",
+                           "--norm-method none",
+                           "--gene-lfc-method mean",
+                           "-t", 
+                           comparisons$NaCl,
+                           "-c",
+                           comparisons$T8,
+                           "-n",
+                           "results/HeLa_test/MAN/Hela_Lib1_Lib2_NaCl_MAGeCK_mean"))
+```
+
+## Annotation and fitness effect score plot
+
+### Annotation
+
+We are going to annotate the genes and write in a table the results from the negative selection analysis.
+```{r, eval=TRUE, warning=FALSE}
+# Loading human Mart
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+res <- read.delim("results/HeLa_test/MAN/Hela_Lib1_Lib2_NaCl_MAGeCK_mean.gene_summary.txt", 
+           stringsAsFactors = F)
+
+# Annotate
+annRes <- getBM(filters = "hgnc_symbol", 
+                     attributes = c("hgnc_symbol", "wikigene_description"), 
+                     values = res$id, 
+                     mart = human)
+
+# Eliminate duplicated
+annRes <- annRes[!duplicated(annRes$hgnc_symbol),]
+# Combine with results from MAGeCK, if no description available NA
+annResMerged <- merge(res, annRes, by.x = "id", by.y = "hgnc_symbol", all.x = TRUE)
+# Retaining desired information, negative selection
+annResNeg <- data.frame(annResMerged[1:8], Gene_Description = annResMerged[,15])
+# Gene description after gene column
+annResNeg <- annResNeg %>% 
+  dplyr::select(id, Gene_Description, everything())
+# Ordering by neg rank
+annResNeg <- annResNeg[order(annResNeg$neg.rank), ]
+# Writting to a csv file
+outputRoot <- "results/HeLa_test/MAN/Supplementary_Table_MAGeCK_output"
+outputNeg <-  paste0(outputRoot, ".tab")
+write.table(annResNeg, 
+          outputNeg,
+          row.names = F,
+          quote = F, 
+          sep = "\t")
+# Writting to a xlsx file
+outputNeg <-  paste0(outputRoot, ".xlsx")
+write.xlsx2(annResNeg, 
+              outputNeg, 
+              row.names = F)
+
+```
+
+### RRA plot
+
+Plot fitness score (RRA score) from MAGeCK 
+```{r, eval=TRUE}
+dir.create("figures/MAN", showWarnings = F, recursive = T)
+
+# Adding color to remark LRRC8A and non-targeting controls
+res <- res %>%
+mutate(remark = ifelse(res[,"id"] == "LRRC8A", 
+                        yes = "LRRC8A", 
+                        no = ifelse(res[,"id"] %in% c("EGFP","luciferase", "LacZ"), 
+                                    yes = "control", 
+                                    no = "other")))
+# Plot
+s <- ggplot(res, aes(x = neg.rank, y = -log10(neg.score)))  + 
+geom_point(aes(colour = factor(remark)), size = 1.75, alpha = 0.8) + 
+geom_point(data = subset(res, remark == "control"), aes(x = neg.rank, y = -log10(neg.score)), color = "#3B9AB2", size = 1.75, alpha = 0.8) + 
+theme_classic(base_size = 16, 
+              base_family = "Arial") +
+theme(panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title=element_text(size=12),
+    panel.background = element_rect(color = "black", size = 0.8),
+    axis.text.x = element_text(size = 12, colour = "black"),
+    axis.text.y = element_text(size = 12, colour = "black"),
+    axis.title.x = element_text(size = 12, colour = "black"),
+    axis.title.y = element_text(size = 12, colour = "black"),
+    legend.position = "none",
+    legend.title = element_blank()) +
+xlab("Gene rank") + 
+ylab(expression(~-log[10]("Fitness effect"))) + 
+geom_text_repel(
+data = subset(res, neg.rank <= 1 | id %in% c("EGFP","luciferase", "LacZ")), # Display SWELL1 + neg.controls
+aes(label = id),
+size = 4,
+box.padding = unit(0.35, "lines"),
+point.padding = unit(0.3, "lines")) + 
+scale_color_manual(values = c("LRRC8A" = "red",
+                              "control" = "#3B9AB2",
+                            "other" = "grey"))
+ggsave(plot = s,
+       filename = "figures/MAN/Hela_Lib1_Lib2_NaCl_MAGeCK_ranked_RRA_plot_only_SWELL1.pdf", device = cairo_pdf,
+       width = 3.1, 
+       height = 3.1)
+
+ggsave(plot = s,
+       filename = "figures/MAN/Hela_Lib1_Lib2_NaCl_MAGeCK_ranked_RRA_plot_only_SWELL1.svg",
+       width = 3.1, 
+       height = 3.1)
+```
+
+
+```{r, eval=TRUE}
+sessionInfo()
+```
+
+
+
+
